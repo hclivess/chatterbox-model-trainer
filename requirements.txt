@@ -1,0 +1,30 @@
+# Chatterbox Training Requirements for Windows + RTX 3060
+# Install with: pip install -r requirements.txt
+
+# PyTorch with CUDA 11.8 (install separately first!)
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# Chatterbox TTS
+chatterbox-tts
+
+# Training libraries
+transformers
+accelerate
+
+# Dataset libraries (specific versions for compatibility - friend's advice!)
+pyarrow==12.0.1
+datasets==2.14.0
+pandas
+
+# Audio processing
+torchaudio
+
+# Monitoring
+tensorboard
+tqdm
+
+# Utilities
+numpy
+
+xxhash
+multiprocess
