@@ -8,7 +8,7 @@ set EPOCHS=3
 set BATCH_SIZE=1
 set GRAD_ACCUM=16
 set LEARNING_RATE=5e-5
-set SAVE_STEPS=50
+set SAVE_STEPS=100
 set EVAL_STEPS=100
 set LOGGING_STEPS=10
 set WARMUP_STEPS=100
@@ -108,38 +108,22 @@ echo STEP 1: Preparing Czech base model...
 echo ============================================================
 
 set CZECH_BASE_DIR=czech_base_model
-if not exist "%CZECH_BASE_DIR%" mkdir "%CZECH_BASE_DIR%"
 
-echo Downloading base Chatterbox components...
-python -c "from huggingface_hub import hf_hub_download; import sys; files = ['ve.safetensors', 't3_cfg.safetensors', 's3gen.safetensors', 'tokenizer.json', 'conds.pt']; [hf_hub_download('%BASE_MODEL%', f, local_dir='%CZECH_BASE_DIR%', local_dir_use_symlinks=False) for f in files]; print('✓ Base model downloaded')"
-
-if errorlevel 1 (
-    echo ERROR: Failed to download base model
-    pause
-    exit /b 1
+if exist "%CZECH_BASE_DIR%\t3_cfg.safetensors" (
+    echo ✓ Czech model already set up at: %CZECH_BASE_DIR%
+    echo   (Delete the folder to re-download)
+) else (
+    echo Running setup script...
+    python setup_czech_model.py
+    
+    if errorlevel 1 (
+        echo ERROR: Failed to setup Czech model
+        pause
+        exit /b 1
+    )
+    
+    echo ✓ Czech base model ready at: %CZECH_BASE_DIR%
 )
-
-echo.
-echo Downloading Czech T3 weights...
-python -c "from huggingface_hub import hf_hub_download; hf_hub_download('%CZECH_T3_REPO%', '%CZECH_T3_FILE%', local_dir='%CZECH_BASE_DIR%', local_dir_use_symlinks=False); print('✓ Czech T3 downloaded')"
-
-if errorlevel 1 (
-    echo ERROR: Failed to download Czech T3 weights
-    pause
-    exit /b 1
-)
-
-echo.
-echo Replacing base T3 with Czech T3...
-copy /Y "%CZECH_BASE_DIR%\%CZECH_T3_FILE%" "%CZECH_BASE_DIR%\t3_cfg.safetensors" >nul
-
-if errorlevel 1 (
-    echo ERROR: Failed to copy Czech T3 weights
-    pause
-    exit /b 1
-)
-
-echo ✓ Czech base model ready at: %CZECH_BASE_DIR%
 
 REM ========================================
 REM Training
@@ -182,8 +166,7 @@ python -u finetune_t3.py ^
   --dataloader_num_workers 4 ^
   --do_train ^
   --do_eval ^
-  --ignore_verifications ^
-  --resume_from_checkpoint
+  --ignore_verifications
 
 set EXIT_CODE=%errorlevel%
 

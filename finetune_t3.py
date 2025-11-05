@@ -31,14 +31,6 @@ from chatterbox.models.t3.modules.t3_config import T3Config
 from chatterbox.models.s3tokenizer import S3_SR, SPEECH_VOCAB_SIZE
 from chatterbox.models.s3gen import S3GEN_SR
 
-#from chatterbox.utils.t3data_arguments import DataArguments
-#from chatterbox.utils.t3dataset import SpeechFineTuningDataset
-
-
-
-
-
-
 logger = logging.getLogger(__name__)
 
 # --- Custom Training Arguments ---
@@ -113,13 +105,18 @@ class SpeechFineTuningDataset(Dataset):
                  hf_dataset: Union[datasets.Dataset, List[Dict[str, str]]],
                  is_hf_format: bool):
         self.data_args = data_args
-        self.chatterbox_model = chatterbox_model
+        
+        self.text_tokenizer = chatterbox_model.tokenizer
+        self.speech_tokenizer = chatterbox_model.s3gen.tokenizer
+        self.voice_encoder = chatterbox_model.ve
+
+        
         self.chatterbox_t3_config = t3_config
         self.dataset_source = hf_dataset
         self.is_hf_format = is_hf_format
 
         self.text_tokenizer = chatterbox_model.tokenizer
-        self.speech_tokenizer: S3Tokenizer = chatterbox_model.s3gen.tokenizer
+        self.speech_tokenizer = chatterbox_model.s3gen.tokenizer
         self.voice_encoder = chatterbox_model.ve
 
         self.s3_sr = S3_SR
@@ -143,9 +140,16 @@ class SpeechFineTuningDataset(Dataset):
                 logger.error(f"Unexpected audio data format for item {idx}: {type(audio_data)}. Skipping.")
                 return None, None
 
-            if not isinstance(wav_array, np.ndarray):
+            if isinstance(wav_array, list):
+                try:
+                    wav_array = np.array(wav_array, dtype=np.float32)
+                except Exception as e:
+                    logger.error(f"Failed to convert list to numpy array for item {idx}: {e}. Skipping.")
+                    return None, None
+            elif not isinstance(wav_array, np.ndarray):
                 logger.error(f"Audio array is not numpy for item {idx}: {type(wav_array)}. Skipping.")
                 return None, None
+
 
             if original_sr != self.s3_sr:
                 wav_16k = librosa.resample(wav_array, orig_sr=original_sr, target_sr=self.s3_sr)
@@ -215,12 +219,10 @@ class SpeechFineTuningDataset(Dataset):
             try:
                 cond_prompt_tokens_batch, _ = self.speech_tokenizer.forward([cond_audio_segment], max_len=self.chatterbox_t3_config.speech_cond_prompt_len)
                 if cond_prompt_tokens_batch is None:
-                    #  logger.error(f"S3Tokenizer returned None for cond_prompt for item {idx}. Using zeros.")
                      cond_prompt_speech_tokens = torch.zeros(self.chatterbox_t3_config.speech_cond_prompt_len, dtype=torch.long)
                 else:
                     cond_prompt_speech_tokens = cond_prompt_tokens_batch.squeeze(0)
             except Exception as e:
-                # logger.error(f"Error getting cond prompt tokens for item {idx}: {e}. Using zeros.")
                 cond_prompt_speech_tokens = torch.zeros(self.chatterbox_t3_config.speech_cond_prompt_len, dtype=torch.long)
 
         if cond_prompt_speech_tokens.size(0) != self.chatterbox_t3_config.speech_cond_prompt_len:
@@ -334,6 +336,7 @@ class SpeechDataCollator:
             "labels_text": labels_text,       # (B, max_text_len - 1) masked with -100
             "labels_speech": labels_speech,   # (B, max_speech_len - 1) masked with -100
         }
+
 # --- Model Wrapper ---
 class T3ForFineTuning(torch.nn.Module):
     def __init__(self, t3_model: T3, chatterbox_t3_config: T3Config):
@@ -391,15 +394,24 @@ class T3ForFineTuning(torch.nn.Module):
 
         return total_loss, speech_logits
 
+    def gradient_checkpointing_enable(self, **kwargs):
+        """Enable gradient checkpointing for the T3 model."""
+        if hasattr(self.t3, "gradient_checkpointing_enable"):
+            self.t3.gradient_checkpointing_enable(**kwargs)
+        else:
+            logger.warning("Inner T3 model does not support gradient_checkpointing_enable.")
+
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing for the T3 model."""
+        if hasattr(self.t3, "gradient_checkpointing_disable"):
+            self.t3.gradient_checkpointing_disable()
+        else:
+            logger.warning("Inner T3 model does not support gradient_checkpointing_disable.")
 
 
 trainer_instance: Optional[Trainer] = None
 
-
-
-
 def main():
-
     global trainer_instance
 
     parser = HfArgumentParser((ModelArguments, DataArguments, CustomTrainingArguments))
@@ -418,10 +430,42 @@ def main():
     logger.info("Loading ChatterboxTTS model...")
 
     original_model_dir_for_copy: Optional[Path] = None
+    
     if model_args.local_model_dir:
         logger.info(f"Loading model from local directory: {model_args.local_model_dir}")
         local_dir_path = Path(model_args.local_model_dir)
-        chatterbox_model = ChatterboxTTS.from_local(ckpt_dir=str(local_dir_path), device="cpu")
+        
+        from safetensors.torch import load_file
+        import torch.nn as nn
+        t3_path = local_dir_path / "t3_cfg.safetensors"
+        
+        if t3_path.exists():
+            t3_state = load_file(t3_path, device="cpu")
+            vocab_size_in_checkpoint = t3_state['text_emb.weight'].shape[0]
+            logger.info(f"T3 checkpoint vocabulary size: {vocab_size_in_checkpoint}")
+            
+            chatterbox_model = ChatterboxTTS.from_pretrained(device="cpu")
+            current_vocab_size = chatterbox_model.t3.text_emb.weight.shape[0]
+            
+            if vocab_size_in_checkpoint != current_vocab_size:
+                logger.info(f"Resizing embeddings: {current_vocab_size} -> {vocab_size_in_checkpoint}")
+                embedding_dim = chatterbox_model.t3.text_emb.weight.shape[1]
+                chatterbox_model.t3.text_emb = nn.Embedding(vocab_size_in_checkpoint, embedding_dim)
+                chatterbox_model.t3.text_head = nn.Linear(embedding_dim, vocab_size_in_checkpoint, bias=False)
+                chatterbox_model.t3.hp.text_tokens_dict_size = vocab_size_in_checkpoint
+            
+            chatterbox_model.t3.load_state_dict(t3_state)
+            
+            ve_path = local_dir_path / "ve.safetensors"
+            if ve_path.exists():
+                chatterbox_model.ve.load_state_dict(load_file(ve_path, device="cpu"))
+            
+            s3gen_path = local_dir_path / "s3gen.safetensors"
+            if s3gen_path.exists():
+                chatterbox_model.s3gen.load_state_dict(load_file(s3gen_path, device="cpu"))
+        else:
+            chatterbox_model = ChatterboxTTS.from_local(ckpt_dir=str(local_dir_path), device="cpu")
+        
         original_model_dir_for_copy = local_dir_path
     else:
         repo_to_download = model_args.model_name_or_path or REPO_ID
@@ -438,7 +482,6 @@ def main():
 
         try: hf_download(repo_id=repo_to_download, filename="conds.pt", local_dir=download_dir, local_dir_use_symlinks=False, cache_dir=model_args.cache_dir)
         except: logger.info("conds.pt not found on Hub or failed to download for this model.")
-
 
         chatterbox_model = ChatterboxTTS.from_local(ckpt_dir=download_dir, device="cpu")
         original_model_dir_for_copy = download_dir
@@ -463,14 +506,9 @@ def main():
     eval_hf_dataset: Optional[Union[datasets.Dataset, List[Dict[str,str]]]] = None 
 
     if data_args.dataset_name:
-        logger.info(f"Loading dataset '{data_args.dataset_name}' from Hugging Face Hub.")
-        raw_datasets_loaded = load_dataset( # Use a different var name to avoid conflict with outer raw_datasets
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            cache_dir=model_args.cache_dir,
-            verification_mode=verification_mode,
-            # trust_remote_code=True # If dataset script requires it
-        )
+        logger.info(f"Loading dataset '{data_args.dataset_name}' from disk.")
+        from datasets import load_from_disk
+        raw_datasets_loaded = load_from_disk(data_args.dataset_name)
         if data_args.train_split_name not in raw_datasets_loaded:
             raise ValueError(f"Train split '{data_args.train_split_name}' not found. Available: {list(raw_datasets_loaded.keys())}")
         train_hf_dataset = raw_datasets_loaded[data_args.train_split_name]
@@ -480,7 +518,7 @@ def main():
                 eval_hf_dataset = raw_datasets_loaded[data_args.eval_split_name]
             elif "validation" in raw_datasets_loaded: eval_hf_dataset = raw_datasets_loaded["validation"]
             elif "test" in raw_datasets_loaded: eval_hf_dataset = raw_datasets_loaded["test"]
-            elif data_args.eval_split_size > 0 and len(train_hf_dataset) > 1 : # Ensure dataset is splittable
+            elif data_args.eval_split_size > 0 and len(train_hf_dataset) > 1 :
                 logger.info(f"Splitting train dataset for evaluation with ratio {data_args.eval_split_size}")
                 split_dataset = train_hf_dataset.train_test_split(test_size=data_args.eval_split_size, seed=training_args.seed)
                 train_hf_dataset, eval_hf_dataset = split_dataset["train"], split_dataset["test"]
@@ -516,9 +554,9 @@ def main():
         train_hf_dataset = all_files # type: ignore
         if data_args.eval_split_size > 0 and training_args.do_eval and len(all_files) > 1:
             split_idx = int(len(all_files) * (1 - data_args.eval_split_size))
-            if split_idx == 0 : split_idx = 1 # Ensure at least one for train if eval gets most
-            if split_idx == len(all_files): split_idx = len(all_files) -1 # Ensure at least one for eval
-            train_hf_dataset, eval_hf_dataset = all_files[:split_idx], all_files[split_idx:] # type: ignore
+            if split_idx == 0 : split_idx = 1
+            if split_idx == len(all_files): split_idx = len(all_files) -1
+            train_hf_dataset, eval_hf_dataset = all_files[:split_idx], all_files[split_idx:]
         is_hf_format_train, is_hf_format_eval = False, False
 
     train_dataset = SpeechFineTuningDataset(data_args,
@@ -527,7 +565,6 @@ def main():
                                             train_hf_dataset,
                                             is_hf_format_train
                                             )
-
 
     eval_dataset = None
     if eval_hf_dataset and training_args.do_eval:
@@ -544,7 +581,6 @@ def main():
 
     hf_trainable_model = T3ForFineTuning(t3_model, chatterbox_t3_config_instance)
 
-    
     callbacks = []
     if training_args.early_stopping_patience is not None and training_args.early_stopping_patience > 0:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=training_args.early_stopping_patience))
@@ -559,7 +595,6 @@ def main():
     )
 
     if training_args.label_names is None: trainer_instance.label_names = ["lables"]
-
 
     if training_args.do_train:
         logger.info("*** Training T3 model ***")
